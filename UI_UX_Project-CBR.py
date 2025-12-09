@@ -1,188 +1,224 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import gower
+import joblib
+import os
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.model_selection import train_test_split
 
-# --- 1. Definisi Fitur (PENTING) ---
-# Pisahkan nama kolom berdasarkan tipenya
-NUMERICAL_COLS = [
-    'Harga', 'Ram', 'Memori_internal', 'Ukuran_layar', 
-    'Resolusi_kamera', 'Kapasitas_baterai', 'Rating_pengguna'
-]
-CATEGORICAL_COLS = ['Brand', 'Os', 'Stok_tersedia']
-IDENTIFIER_COL = 'Nama_hp'
+# ==========================================
+# 1. KONFIGURASI HALAMAN & FUNGSI UTAMA
+# ==========================================
+st.set_page_config(
+    page_title="Sistem Rekomendasi HP (Gower + k-NN)",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
+# Nama file dataset dan model
+DATA_FILE = 'dataset_handphone_cleaned.csv'
+MODEL_FILE = 'gower_recommender_model.pkl'
 
-# --- 2. Fungsi Memuat, MEMBERSIHKAN, dan Menghitung Rentang ---
-@st.cache_data
-def load_clean_and_precompute(filepath):
+# Fitur yang digunakan untuk perhitungan (Harus sama persis dengan saat training)
+FEATURES = ['Brand', 'Harga', 'RAM', 'Storage', 'Layar', 'Kamera', 'Baterai', 'OS']
+
+@st.cache_resource
+def load_or_train_model(force_retrain=False):
     """
-    Memuat data MENTAH dari 'dataset.handphone.csv', membersihkannya, 
-    dan menghitung rentang (Range).
+    Mencoba memuat model yang tersimpan. 
+    Jika tidak ada atau force_retrain=True, akan melatih ulang model.
     """
+    model_data = {}
+    
+    # Coba load dataset dulu untuk referensi UI
     try:
-        # 1. Muat data mentah dengan delimiter ;
-        df = pd.read_csv(filepath, delimiter=';')
-        
-        # 2. Tentukan fitur yang akan kita gunakan
-        all_cols_to_keep = [IDENTIFIER_COL] + NUMERICAL_COLS + CATEGORICAL_COLS
-        
-        # Ambil hanya kolom yang kita perlukan
-        df = df[all_cols_to_keep]
-
-        # --- 3. Pembersihan Data (di dalam Streamlit) ---
-        # 3a. Bersihkan Harga
-        df['Harga'] = df['Harga'].astype(str).str.replace(r'[.]', '', regex=True).str.replace(r'[,]', '.', regex=True)
-        
-        # 3b. Bersihkan Resolusi_kamera (hapus 'MP')
-        df['Resolusi_kamera'] = df['Resolusi_kamera'].astype(str).str.replace('MP', '', regex=False)
-        
-        # 3c. Konversi 'Stok_tersedia' ke string
-        df['Stok_tersedia'] = df['Stok_tersedia'].astype(str)
-
-        # 3d. Konversi semua kolom numerik
-        df[NUMERICAL_COLS] = df[NUMERICAL_COLS].apply(pd.to_numeric, errors='coerce')
-        
-        # 3e. Isi NaNs di kolom kategorikal dengan 'Unknown'
-        for col in CATEGORICAL_COLS:
-            df[col] = df[col].fillna('Unknown')
-            
-        # 3f. Hapus baris yang memiliki NaN di kolom penting
-        df_cleaned = df.dropna(subset=[IDENTIFIER_COL] + NUMERICAL_COLS).reset_index(drop=True)
-        
-        # 3g. Ubah tipe data numerik yang seharusnya integer (agar tampilan dropdown bersih, tidak ada .0)
-        int_cols = ['Ram', 'Memori_internal', 'Resolusi_kamera', 'Kapasitas_baterai']
-        for col in int_cols:
-            if col in df_cleaned.columns:
-                df_cleaned[col] = df_cleaned[col].astype(int)
-        
-        # --- 4. Penghitungan Rentang (Pre-computation) ---
-        # Hitung rentang HANYA untuk kolom numerik
-        ranges = df_cleaned[NUMERICAL_COLS].max() - df_cleaned[NUMERICAL_COLS].min()
-        ranges[ranges == 0] = 1  # Hindari pembagian dengan nol
-        
-        # 5. Dapatkan nilai unik untuk UI (UPDATE: Mengambil unik untuk SEMUA kolom agar bisa jadi dropdown)
-        # Kita gabungkan kolom kategorikal dan numerik (kecuali Harga biasanya input manual, tapi kita masukkan saja)
-        ui_cols = CATEGORICAL_COLS + NUMERICAL_COLS
-        ui_options = {col: sorted(df_cleaned[col].unique().tolist()) for col in ui_cols}
-        
-        return df_cleaned, ranges, ui_options
-        
+        # Pastikan delimiter sesuai dengan file CSV Anda (biasanya , atau ;)
+        df = pd.read_csv(DATA_FILE)
     except FileNotFoundError:
-        st.error(f"File {filepath} tidak ditemukan. Pastikan 'dataset.handphone.csv' ada di folder yang sama.")
-        return None, None, None
-    except KeyError as e:
-        st.error(f"Kolom yang diperlukan tidak ditemukan: {e}. Pastikan file CSV Anda memiliki kolom yang benar.")
-        return None, None, None
-    except Exception as e:
-        st.error(f"Terjadi kesalahan saat memuat atau membersihkan data: {e}")
-        return None, None, None
+        st.error(f"File '{DATA_FILE}' tidak ditemukan! Pastikan file csv ada di folder yang sama.")
+        return None
 
-# --- 3. Fungsi Gower's Similarity (MIXED DATA) ---
-def calculate_gower_similarity(case_base, new_case, db_ranges):
-    """
-    Menghitung Gower's Similarity untuk TIPE DATA CAMPURAN.
-    """
-    similarity_scores = []
-    
-    # 1. Hitung similaritas untuk fitur NUMERIK
-    for col in NUMERICAL_COLS:
-        # Jika user input tidak sama persis dengan database, kita hitung jaraknya
-        abs_diff = (case_base[col] - new_case[col]).abs()
-        s_i = 1 - (abs_diff / db_ranges[col])
-        similarity_scores.append(s_i)
-        
-    # 2. Hitung similaritas untuk fitur KATEGORIKAL
-    for col in CATEGORICAL_COLS:
-        s_i = (case_base[col] == new_case[col]).astype(int)
-        similarity_scores.append(s_i)
+    # Cek apakah perlu load file model atau train ulang
+    if not force_retrain and os.path.exists(MODEL_FILE):
+        try:
+            model_data = joblib.load(MODEL_FILE)
+        except Exception as e:
+            st.warning(f"File model rusak, melatih ulang... (Error: {e})")
+            force_retrain = True
+    else:
+        force_retrain = True
 
-    # 3. Gabungkan semua skor
-    all_scores = pd.concat(similarity_scores, axis=1)
-    
-    # 4. Total similaritas adalah rata-rata dari semua skor fitur
-    total_similarity = all_scores.mean(axis=1)
-    
-    # 5. Buat DataFrame hasil
-    results_df = pd.DataFrame({
-        IDENTIFIER_COL: case_base[IDENTIFIER_COL],
-        'Similarity': total_similarity,
-    }).sort_values(by='Similarity', ascending=False).reset_index(drop=True)
-    
-    return results_df
+    # Proses Training Ulang
+    if force_retrain:
+        with st.spinner("Sedang melatih model baru..."):
+            # 1. Buat Label Kelas Harga
+            df['Kelas_Harga'] = pd.qcut(df['Harga'], q=3, labels=['Budget/Entry', 'Mid-Range', 'Flagship'])
+            
+            # 2. Siapkan Data
+            X = df[FEATURES].copy()
+            y = df['Kelas_Harga']
+            
+            # Pastikan tipe data benar
+            X['Brand'] = X['Brand'].astype('object')
+            X['OS'] = X['OS'].astype('object')
+            
+            # 3. Hitung Matriks Gower
+            try:
+                gower_dist = gower.gower_matrix(X)
+            except Exception as e:
+                st.error(f"Gagal menghitung Gower Distance: {e}")
+                st.stop()
+            
+            # 4. Train k-NN
+            knn = KNeighborsClassifier(n_neighbors=5, metric='precomputed')
+            knn.fit(gower_dist, y)
+            
+            # Simpan ke dictionary
+            model_data = {
+                'knn_model': knn,
+                'reference_data': X,     # Data X (Features)
+                'full_data': df          # Data Lengkap
+            }
+            
+            # Simpan jadi file
+            joblib.dump(model_data, MODEL_FILE)
+            
+    return model_data
 
-# --- 4. Setup UI Streamlit ---
-st.set_page_config(page_title="CBR Handphone", layout="wide")
-st.title("📱 CBR Handphone (Gower's Similarity - Dropdown UI)")
-st.write("Silahkan pilih spesifikasi yang diinginkan dari opsi yang tersedia.")
+# ==========================================
+# 2. LOAD DATA & MODEL
+# ==========================================
+# Tombol reset di sidebar untuk mengatasi error model lama
+st.sidebar.title("⚙️ Pengaturan")
+if st.sidebar.button("🔄 Reset / Latih Ulang Model"):
+    st.cache_resource.clear()
+    if os.path.exists(MODEL_FILE):
+        os.remove(MODEL_FILE)
+    st.rerun()
 
-# Muat, BERSIHKAN, dan hitung rentang dari file ASLI
-df_case_base, db_ranges, ui_options = load_clean_and_precompute('dataset.handphone.csv')
+data_model = load_or_train_model()
 
-if df_case_base is not None:
-    with st.expander("Lihat Database Kasus (Telah Dibersihkan)"):
-        st.dataframe(df_case_base)
+if data_model is None:
+    st.stop()
 
-    # Dapatkan min/max untuk slider/input harga
-    min_vals = df_case_base[NUMERICAL_COLS].min()
-    max_vals = df_case_base[NUMERICAL_COLS].max()
+knn = data_model['knn_model']
+X_ref = data_model['reference_data']
+df_full = data_model['full_data']
 
-    # --- Sidebar untuk Input Kasus Baru ---
-    st.sidebar.header("Masukkan Spesifikasi (Kasus Baru):")
+# ==========================================
+# 3. INTERFACE PENGGUNA (SIDEBAR INPUT)
+# ==========================================
+st.sidebar.header("🛠️ Input Spesifikasi Idaman")
+
+user_input = {}
+
+# --- A. Input Brand & OS (Kategorikal) ---
+available_brands = sorted(X_ref['Brand'].astype(str).unique())
+available_os = sorted(X_ref['OS'].astype(str).unique())
+
+user_input['Brand'] = st.sidebar.selectbox("Brand", options=available_brands)
+user_input['OS'] = st.sidebar.selectbox("Sistem Operasi", options=available_os, index=0)
+
+# --- B. Input Harga (Numerik Kontinu) ---
+min_price = int(X_ref['Harga'].min())
+max_price = int(X_ref['Harga'].max())
+default_price = int(X_ref['Harga'].median())
+
+user_input['Harga'] = st.sidebar.number_input(
+    "Budget Harga (Rp)", 
+    min_value=min_price, 
+    max_value=max_price * 3, 
+    value=default_price, 
+    step=100000
+)
+
+# --- C. Input RAM & Storage (Numerik Diskrit) ---
+available_ram = sorted(X_ref['RAM'].unique())
+available_storage = sorted(X_ref['Storage'].unique())
+
+def get_closest_index(lst, val):
+    try:
+        return lst.index(min(lst, key=lambda x: abs(x-val)))
+    except:
+        return 0
+
+idx_ram = get_closest_index(available_ram, 8) 
+idx_store = get_closest_index(available_storage, 128)
+
+user_input['RAM'] = st.sidebar.selectbox("RAM (GB)", options=available_ram, index=idx_ram)
+user_input['Storage'] = st.sidebar.selectbox("Memori Internal (GB)", options=available_storage, index=idx_store)
+
+# --- D. Input Lainnya (Slider) ---
+user_input['Layar'] = st.sidebar.slider("Ukuran Layar (inch)", 4.0, 8.0, 6.5, 0.1)
+user_input['Kamera'] = st.sidebar.slider("Kamera Utama (MP)", 8, 200, 50, 2)
+user_input['Baterai'] = st.sidebar.slider("Kapasitas Baterai (mAh)", 2000, 7000, 5000, 100)
+
+# ==========================================
+# 4. LOGIKA UTAMA (PREDIKSI & REKOMENDASI)
+# ==========================================
+st.title("📱 AI Rekomendasi Handphone")
+st.markdown("Cari HP yang paling mirip dengan spesifikasi impianmu menggunakan **Gower Distance**.")
+
+if st.sidebar.button("🔍 Cari Rekomendasi", type="primary"):
     
-    new_case_input = {}
+    # 1. Konversi Input User ke DataFrame
+    df_input = pd.DataFrame([user_input])
     
-    # --- Input Harga (Tetap Number Input atau Slider biasanya lebih fleksibel, tapi sisa numerik jadi dropdown) ---
-    st.sidebar.subheader("Fitur Numerik")
+    # [PENTING] Re-order kolom agar sesuai urutan FEATURES saat training
+    # Ini mencegah error mismatch tipe data (misal: String dibandingkan dengan Float)
+    df_input = df_input[FEATURES]
     
-    # Harga tetap number input karena budget orang spesifik, tidak terpaku pada nilai diskrit database
-    new_case_input['Harga'] = st.sidebar.number_input(
-        "Harga (Rp) - Masukkan Budget", 
-        min_value=float(min_vals['Harga']), 
-        max_value=float(max_vals['Harga'] * 1.5),
-        value=float(df_case_base['Harga'].median()),
-        step=100000.0
-    )
-    
-    # --- BAGIAN YANG DIUBAH: SLIDER MENJADI DROPDOWN (SELECTBOX) ---
-    # Loop mulai dari index 1 karena index 0 adalah 'Harga' yang sudah dihandle diatas
-    for col in NUMERICAL_COLS[1:]: 
-        # Ambil opsi unik yang tersedia dari fungsi load data
-        available_options = ui_options[col]
-        
-        # Cari nilai median untuk dijadikan default index agar tidak otomatis memilih yang terkecil
-        median_val = df_case_base[col].median()
-        # Cari index di list options yang nilainya paling dekat dengan median
-        default_index = min(range(len(available_options)), key=lambda i: abs(available_options[i]-median_val))
-        
-        new_case_input[col] = st.sidebar.selectbox(
-            col.replace("_", " ").title(), # Label cantik
-            options=available_options,     # Pilihan dari data yang ada
-            index=default_index            # Default value
-        )
-        
-    # --- Input Kategorikal (Selectbox) - Tidak Berubah ---
-    st.sidebar.subheader("Fitur Kategorikal")
-    for col in CATEGORICAL_COLS:
-        new_case_input[col] = st.sidebar.selectbox(
-            col.replace("_", " ").title(), 
-            options=sorted(ui_options[col]) 
-        )
+    # Pastikan tipe data konsisten
+    df_input['Brand'] = df_input['Brand'].astype('object')
+    df_input['OS'] = df_input['OS'].astype('object')
 
-    # --- Tombol dan Tampilan Hasil ---
-    if st.sidebar.button("🔍 Cari Handphone Serupa"):
-        st.header("Hasil Rekomendasi (Paling Mirip)")
-        
-        # Hitung similaritas
-        results = calculate_gower_similarity(df_case_base, new_case_input, db_ranges)
-        
-        # Gabungkan hasil dengan data asli untuk perbandingan
-        results_detailed = pd.merge(results, df_case_base, on=IDENTIFIER_COL)
-        
-        # Format kolom similarity
-        results_detailed['Similarity'] = results_detailed['Similarity'].map('{:.2%}'.format)
-        
-        # Tampilkan 10 hasil teratas
-        st.dataframe(results_detailed.head(10))
+    with st.spinner('Sedang menghitung kemiripan...'):
+        try:
+            # 2. Hitung Jarak Gower
+            distances = gower.gower_matrix(df_input, X_ref)[0]
+            
+            # 3. Prediksi Kelas Harga
+            prediksi_kelas = knn.predict([distances])[0]
+            
+            # 4. Cari Top N
+            top_n = 10
+            sorted_indices = distances.argsort()[:top_n]
+            
+            # --- TAMPILKAN HASIL ---
+            st.divider()
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                st.info("Prediksi Kategori")
+            with col2:
+                st.success(f"HP ini masuk kategori: **{prediksi_kelas}**")
+
+            st.subheader(f"Top {top_n} Rekomendasi")
+            
+            results = []
+            for idx in sorted_indices:
+                row_data = df_full.iloc[idx]
+                similarity_score = (1 - distances[idx]) * 100 
+                
+                results.append({
+                    'Nama HP': row_data['Nama_HP'],
+                    'Kemiripan': f"{similarity_score:.2f}%",
+                    'Harga': f"Rp {row_data['Harga']:,.0f}",
+                    'RAM': f"{row_data['RAM']} GB",
+                    'Storage': f"{row_data['Storage']} GB",
+                    'Layar': f"{row_data['Layar']}\"",
+                    'Kamera': f"{row_data['Kamera']} MP",
+                    'Baterai': f"{row_data['Baterai']} mAh",
+                    'Kelas': row_data['Kelas_Harga']
+                })
+            
+            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+            
+        except Exception as e:
+            st.error(f"Terjadi kesalahan saat perhitungan: {e}")
+            st.write("Tips: Coba klik tombol 'Reset / Latih Ulang Model' di sidebar paling atas.")
 
 else:
-    st.error("Aplikasi tidak dapat dimulai karena gagal memuat data.")
+    st.info("👈 Masukkan spesifikasi di sidebar kiri, lalu klik tombol **Cari Rekomendasi**.")
+    with st.expander("Lihat Database HP"):
+        st.dataframe(df_full.drop(columns=['Kelas_Harga'], errors='ignore'))
